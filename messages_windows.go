@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	lru "github.com/hashicorp/golang-lru"
 	errors "github.com/pkg/errors"
@@ -18,12 +19,21 @@ import (
 )
 
 var (
-	mui_dir_regex = regexp.MustCompile("^[a-z]{2}-[a-z]{2}$")
-	invalidGUID   = errors.New("invalidGUID")
+	// Search for potential MUI files - these are typically found in
+	// directories names like " en-US cz-CZ
+	mui_dir_regex   = regexp.MustCompile("^[a-z]{2}-[a-z]{2}$")
+	system_root_re  = regexp.MustCompile("(?i)%?SystemRoot%?")
+	windir_re       = regexp.MustCompile("(?i)%windir%")
+	programfiles_re = regexp.MustCompile("(?i)%programfiles%")
+	system32_re     = regexp.MustCompile(`(?i)\\System32\\`)
+
+	invalidGUID = errors.New("invalidGUID")
 
 	mui_debug = 0
 )
 
+// NewWindowsMessageResolver is the constructor for the
+// WindowsMessageResolver.
 func NewWindowsMessageResolver(
 	opts MessageResolverOpts) (*WindowsMessageResolver, error) {
 	lru_size := opts.LRUSize
@@ -35,7 +45,8 @@ func NewWindowsMessageResolver(
 	if err != nil {
 		return nil, err
 	}
-	res := &WindowsMessageResolver{
+
+	self := &WindowsMessageResolver{
 		// string->MessageSet
 		cache: cache,
 
@@ -43,25 +54,55 @@ func NewWindowsMessageResolver(
 		// periodically.
 		mui_cache:        make(map[string][]string),
 		checked_mui_dirs: make(map[string]bool),
+		opts:             opts,
 	}
 
-	res.buildMUIcache()
+	self.system_root = os.Getenv("SystemRoot")
+	if self.system_root == "" {
+		self.system_root = "C:/Windows/"
+	}
 
-	return res, res.sortMRUWithRegexp(opts.LangPreferenceRegeExp)
+	filter := opts.LangPreferenceRegeExp
+	if filter == "" {
+		filter = "en-(US|AU|GB)"
+	}
+
+	filter_re, err := regexp.Compile("(?i)" + filter)
+	if err != nil {
+		return nil, err
+	}
+
+	self.lang_filter_re = filter_re
+
+	// Get MUI files from e.g. C:\Windows\System32\en-US\*.mui
+	self.buildMUIcacheFromDir(
+		filepath.Join(self.system_root, "System32"), mui_dir_regex)
+
+	// Get MUI files from e.g. C:\Windows\WinSxS\*\*.mui
+	// This seems to slow things down a lot because there are many SxS dlls typically.
+	//self.buildMUIcacheFromDir(
+	//	filepath.Join(system_root, "WinSxS"), nil)
+
+	return self, nil
 }
 
 type WindowsMessageResolver struct {
 	cache *lru.Cache
 
+	// Protect the below
+	mu               sync.Mutex
 	mui_cache        map[string][]string
 	checked_mui_dirs map[string]bool
-
-	location_expander func([]string) []string
+	system_root      string
+	lang_filter_re   *regexp.Regexp
+	opts             MessageResolverOpts
 }
 
+// Discover possible MUI files in the directory specified.
 func (self *WindowsMessageResolver) buildMUIcacheFromDir(
 	directory string, dir_regex *regexp.Regexp) {
 
+	// Only process directory once.
 	_, pres := self.checked_mui_dirs[directory]
 	if pres {
 		return
@@ -95,8 +136,10 @@ func (self *WindowsMessageResolver) buildMUIcacheFromDir(
 
 			basename := strings.TrimSuffix(filepath.Base(filename), ".mui")
 			locations, _ := self.mui_cache[basename]
-			locations = append(locations, fullpath)
-			self.mui_cache[basename] = locations
+
+			// Make sure the mui_cache is always properly sorted.
+			self.mui_cache[basename] = self.sortListWithPreference(
+				append(locations, fullpath))
 
 			if mui_debug > 0 {
 				fmt.Printf("buildMUIcacheFromDir: adding %v to %v\n", fullpath, basename)
@@ -105,22 +148,20 @@ func (self *WindowsMessageResolver) buildMUIcacheFromDir(
 	}
 }
 
-func (self *WindowsMessageResolver) buildMUIcache() {
-	self.mui_cache = make(map[string][]string)
-
-	system_root := os.Getenv("SystemRoot")
-	if system_root == "" {
-		system_root = "C:/Windows/"
-	}
-
-	// Get MUI files from e.g. C:\Windows\System32\en-US\*.mui
-	self.buildMUIcacheFromDir(
-		filepath.Join(system_root, "System32"), mui_dir_regex)
-
-	// Get MUI files from e.g. C:\Windows\WinSxS\*\*.mui
-	// This seems to slow things down a lot because there are many SxS dlls typically.
-	//self.buildMUIcacheFromDir(
-	//	filepath.Join(system_root, "WinSxS"), nil)
+// ExpandMessageFileLocation Produces a list of possible locations the
+// message file may be. We process all of them because sometimes event
+// messages are split across multiple dlls. For example, a generic
+// message table may exist in C:\Windows\System32\XXX.dll but a
+// localized message table also exists in
+// C:\Windows\System32\en-us\XXX.dll.mui
+//
+// NOTE: This function will effectively be called once per provider
+// since there is a higher level provider LRU cache. So it is probably
+// not worth memoizing it.
+func (self *WindowsMessageResolver) ExpandMessageFileLocation(
+	message_file string) []string {
+	self.mu.Lock()
+	defer self.mu.Unlock()
 
 	windir := os.Getenv("WinDir")
 	programfiles := os.Getenv("programfiles")
@@ -130,7 +171,8 @@ func (self *WindowsMessageResolver) buildMUIcache() {
 	replace_env_vars := func(paths []string) []string {
 		result := []string{}
 		for _, path := range paths {
-			path = system_root_re.ReplaceAllLiteralString(path, system_root)
+			path = system_root_re.ReplaceAllLiteralString(
+				path, self.system_root)
 
 			path = windir_re.ReplaceAllLiteralString(path, windir)
 
@@ -161,11 +203,14 @@ func (self *WindowsMessageResolver) buildMUIcache() {
 					path, "\\SysWow64\\"))
 			}
 		}
-
 		return result
 	}
 
-	// On international systems messages may be stored in MUI files.
+	// On international systems messages may be stored in MUI
+	// files. This appends possible MUI files **after** the provided
+	// list. The search order looks at the provided list first
+	// (usually System32) and then only if the message is not found
+	// consults the MUI files.
 	include_muis := func(paths []string) []string {
 		result := []string{}
 		seen := make(map[string]bool)
@@ -175,18 +220,24 @@ func (self *WindowsMessageResolver) buildMUIcache() {
 
 			dirname := filepath.Dir(path)
 
-			// Make sure we checked this directory for MUI files.
+			// Make sure we checked this directory for MUI
+			// files. Sometimes an application will distribute MUI
+			// files inside its own path.
 			self.buildMUIcacheFromDir(dirname, mui_dir_regex)
 
 			dll_name := strings.ToLower(filepath.Base(path))
+
+			// process each dll only once to avoid recursion.
 			_, pres := seen[dll_name]
 			if pres {
 				continue
 			}
 			seen[dll_name] = true
 
+			// Append all muis in search order.
 			muis, pres := self.mui_cache[dll_name]
 			if pres {
+				// muis list is always properly sorted in search order.
 				result = append(result, muis...)
 			}
 		}
@@ -206,17 +257,12 @@ func (self *WindowsMessageResolver) buildMUIcache() {
 		return result
 	}
 
-	self.location_expander = func(in []string) []string {
-		res := filter_files(
-			include_muis(
-				split_system32(
-					replace_env_vars(in))))
-
-		return res
-	}
+	locations := strings.Split(message_file, ";")
+	return filter_files(
+		include_muis(split_system32(replace_env_vars(locations))))
 }
 
-func (self *WindowsMessageResolver) getMessageSets(
+func (self *WindowsMessageResolver) GetMessageSets(
 	provider, channel string) (*MessageSet, error) {
 
 	// Get provider from cache - the cache key is both provider and
@@ -249,7 +295,7 @@ func (self *WindowsMessageResolver) getMessageSets(
 func (self *WindowsMessageResolver) GetMessage(
 	provider, channel string, event_id, number_of_expansions int) string {
 
-	message_set, err := self.getMessageSets(provider, channel)
+	message_set, err := self.GetMessageSets(provider, channel)
 	if err != nil {
 		return ""
 	}
@@ -265,7 +311,7 @@ func (self *WindowsMessageResolver) GetMessage(
 func (self *WindowsMessageResolver) GetParameter(
 	provider, channel string, parameter_id int) string {
 
-	message_set, err := self.getMessageSets(provider, channel)
+	message_set, err := self.GetMessageSets(provider, channel)
 	if err != nil {
 		return ""
 	}
@@ -278,23 +324,6 @@ func (self *WindowsMessageResolver) GetParameter(
 }
 
 func (self *WindowsMessageResolver) Close() {}
-
-// ExpandLocations Produces a list of possible locations the message
-// file may be. We process all of them because sometimes event
-// messages are split across multiple dlls. For example, a generic
-// message table may exist in C:\Windows\System32\XXX.dll but a
-// localized message table also exists in
-// C:\Windows\System32\en-us\XXX.dll.mui
-func (self *WindowsMessageResolver) ExpandLocations(
-	message_file string) []string {
-
-	// Message file values may be separated by ;
-	res := self.location_expander(strings.Split(message_file, ";"))
-	if mui_debug > 0 {
-		fmt.Printf("ExpandLocations: %v %v\n", message_file, res)
-	}
-	return res
-}
 
 func (self *WindowsMessageResolver) GetMessagesByGUID(
 	provider_guid, channel string) (*MessageSet, error) {
@@ -338,11 +367,11 @@ func (self *WindowsMessageResolver) GetMessagesByGUID(
 		provider = provider_guid
 	}
 
-	return self.expandLocations(
+	return self.GetMessageSetsForProvider(
 		message_files, parameter_files, provider, channel)
 }
 
-func (self *WindowsMessageResolver) expandLocations(
+func (self *WindowsMessageResolver) GetMessageSetsForProvider(
 	message_files, parameter_files,
 	provider, channel string) (*MessageSet, error) {
 	msg_set := &MessageSet{
@@ -353,18 +382,19 @@ func (self *WindowsMessageResolver) expandLocations(
 		Filenames:  make(map[string]int),
 	}
 
-	self.populateMessages(message_files, msg_set.AddMessage)
+	self.PopulateMessages(message_files, msg_set.AddMessage)
 	if parameter_files != "" {
-		self.populateMessages(parameter_files, msg_set.AddParameter)
+		self.PopulateMessages(parameter_files, msg_set.AddParameter)
 	}
 
 	return msg_set, nil
 }
 
-func (self *WindowsMessageResolver) populateMessages(
+func (self *WindowsMessageResolver) PopulateMessages(
 	message_files string,
 	adder func(event_id int, message string, filename string)) {
-	for _, message_file := range self.ExpandLocations(message_files) {
+	for _, message_file := range self.ExpandMessageFileLocation(
+		message_files) {
 		fd, err := os.Open(message_file)
 		if err != nil {
 			continue
@@ -430,5 +460,5 @@ func (self *WindowsMessageResolver) GetMessages(
 	if mui_debug > 1 {
 		fmt.Printf("GetMessages %v %v: %v\n", provider, channel, message_files)
 	}
-	return self.expandLocations(message_files, "", provider, channel)
+	return self.GetMessageSetsForProvider(message_files, "", provider, channel)
 }
