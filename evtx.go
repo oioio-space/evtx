@@ -31,6 +31,13 @@ import (
 	errors "github.com/pkg/errors"
 )
 
+// maxTemplateArguments caps how many template-instance arguments
+// ParseTemplateInstance will iterate over. numArguments is read from the
+// stream as an attacker-controlled uint32 (up to ~4.29e9); this bounds the
+// resulting append loop regardless of which of the two read sites produced
+// the value.
+const maxTemplateArguments = 1024 * 10
+
 const (
 	EVTX_HEADER_MAGIC       = "ElfFile\x00"
 	EVTX_CHUNK_HEADER_MAGIC = "ElfChnk\x00"
@@ -362,7 +369,7 @@ func NewParseContext(chunk *Chunk) *ParseContext {
 }
 
 func (self *ParseContext) ConsumeUint8() uint8 {
-	if self.offset > len(self.buff) {
+	if self.offset+1 > len(self.buff) {
 		return 0
 	}
 	result := self.buff[self.offset]
@@ -704,9 +711,6 @@ func ParseTemplateInstance(ctx *ParseContext) bool {
 	// Template arguments should not be unreasonable here. Just cap
 	// them at a reasonable size.
 	numArguments := ctx.ConsumeUint32()
-	if numArguments > 1024*10 {
-		numArguments = 10 * 1024
-	}
 
 	debug("template id %x\n", short_id)
 
@@ -723,6 +727,17 @@ func ParseTemplateInstance(ctx *ParseContext) bool {
 		ctx.SkipBytes(templateBodyLen)
 		numArguments = ctx.ConsumeUint32()
 	}
+
+	// numArguments is read from the stream twice above (once on the fast
+	// path, once more in the !pres branch taken by any template not
+	// already known - which is every template in a file forged from
+	// scratch, since a short_id cannot be "known" without first being
+	// defined by that same branch). Capping only the first read, as a
+	// prior version of this function did, left the second read - the one
+	// a forged file actually reaches - unbounded. Cap once here, after
+	// both possible reads and before the read value is used as an
+	// append-loop bound.
+	numArguments = min(numArguments, maxTemplateArguments)
 
 	debug("ParseTemplateInstance Parse %x args @ %x\n", numArguments, ctx.Offset())
 
