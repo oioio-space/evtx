@@ -737,7 +737,9 @@ func ParseTemplateInstance(ctx *ParseContext) bool {
 	// a forged file actually reaches - unbounded. Cap once here, after
 	// both possible reads and before the read value is used as an
 	// append-loop bound.
-	numArguments = min(numArguments, maxTemplateArguments)
+	if numArguments > maxTemplateArguments {
+		numArguments = maxTemplateArguments
+	}
 
 	debug("ParseTemplateInstance Parse %x args @ %x\n", numArguments, ctx.Offset())
 
